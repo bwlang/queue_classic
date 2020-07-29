@@ -90,10 +90,25 @@ module QC
 
     def lock
       QC.log_yield(:measure => 'queue.lock') do
-        s = "UPDATE queue_classic_jobs SET locked_at = now(), locked_by = pg_backend_pid()
-             WHERE id IN ( SELECT id FROM queue_classic_jobs WHERE locked_at IS NULL AND
-             q_name = $1 AND scheduled_at <= now() LIMIT 1 FOR NO KEY UPDATE SKIP LOCKED )
-             RETURNING *"
+        s = <<~SQL
+          WITH selected_job AS (
+            SELECT id
+            FROM queue_classic_jobs
+            WHERE
+              locked_at IS NULL AND
+              q_name = $1 AND
+              scheduled_at <= now()
+            LIMIT 1
+            FOR NO KEY UPDATE SKIP LOCKED
+          )
+          UPDATE queue_classic_jobs
+          SET
+            locked_at = now(),
+            locked_by = pg_backend_pid()
+          FROM selected_job
+          WHERE queue_classic_jobs.id = selected_job.id
+          RETURNING *
+        SQL
 
         if r = conn_adapter.execute(s, name)
           {}.tap do |job|
@@ -102,11 +117,7 @@ module QC
             job[:method] = r["method"]
             job[:args] = JSON.parse(r["args"])
             if r["scheduled_at"]
-              if r["scheduled_at"].is_a?(Time)
-                job[:scheduled_at] = r["scheduled_at"]
-              else
-                raise "expected r[:scheduled_at] to be a Time object"
-              end
+              job[:scheduled_at] = r["scheduled_at"].kind_of?(Time) ? r["scheduled_at"] : Time.parse(r["scheduled_at"])
               ttl = Integer((Time.now - job[:scheduled_at]) * 1000)
               QC.measure("time-to-lock=#{ttl}ms source=#{name}")
             end
